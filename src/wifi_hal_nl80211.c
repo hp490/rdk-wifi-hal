@@ -2636,6 +2636,19 @@ int process_mgmt_frame(struct nl_msg *msg, void *arg)
         wifi_hal_dbg_print("%s:%d: received spurious frame event:%d"
             " on interface %s from" MACSTR " sent to hostapd wds:%d.\n", __func__, __LINE__,
             gnlh->cmd, interface->name, MAC2STR(event.rx_from_unknown.addr), event.rx_from_unknown.wds);
+
+#ifdef NL80211_ACL
+        /* STA removed/blocked by ACL must not be re-admitted via a stale 4addr/unknown frame */
+        if (interface->vap_info.vap_mode == wifi_vap_mode_ap &&
+            is_core_acl_drop_mgmt_frame(interface, (u8 *)event.rx_from_unknown.addr)) {
+            wifi_hal_dbg_print("%s:%d: MAC " MACSTR " blocked by ACL, dropping spurious frame "
+                "event:%d and kicking STA on interface %s\n", __func__, __LINE__,
+                MAC2STR(event.rx_from_unknown.addr), gnlh->cmd, interface->name);
+            nl80211_kick_device(interface, (u8 *)event.rx_from_unknown.addr);
+            return NL_SKIP;
+        }
+#endif
+
         pthread_mutex_lock(&g_wifi_hal.hapd_lock);
         if (interface->vap_info.vap_mode != wifi_vap_mode_ap || is_wifi_hal_vap_mesh_sta(interface->vap_info.vap_index)) {
 #if defined(BANANA_PI_PORT) && (HOSTAPD_VERSION >= 211)

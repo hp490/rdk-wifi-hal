@@ -2280,6 +2280,15 @@ INT wifi_hal_delApAclDevice(INT apIndex, mac_address_t DeviceMacAddress)
         free(acl_map);
     }
 
+    /* Kick before ACL update so the STA is still in the kernel station table */
+    if ((vap->u.bss_info.mac_filter_enable == true) &&
+        (vap->u.bss_info.mac_filter_mode == wifi_mac_filter_mode_white_list)) {
+        if (nl80211_kick_device(interface, DeviceMacAddress) != 0) {
+            wifi_hal_info_print("%s:%d: STA %s not associated on ap_index %d, skip kick\n", __func__,
+                __LINE__, key, apIndex);
+        }
+    }
+
     if (nl80211_set_acl(interface) != 0) {
         acl_map = (acl_map_t *)malloc(sizeof(acl_map_t));
         wifi_hal_error_print("%s:%d MAC %s nl80211_set_acl failure for interface:%s\n", __func__, __LINE__, key, interface->name);
@@ -2329,6 +2338,17 @@ INT wifi_hal_delApAclDevice(INT apIndex, CHAR *DeviceMacAddress)
     hash_map_remove(interface->acl_map, DeviceMacAddress);
     if (acl_map != NULL) {
         free(acl_map);
+    }
+
+    /* Kick before ACL update so the STA is still in the kernel station table */
+    if ((vap->u.bss_info.mac_filter_enable == true) &&
+        (vap->u.bss_info.mac_filter_mode == wifi_mac_filter_mode_white_list)) {
+        mac_address_t sta_mac;
+        to_mac_bytes(DeviceMacAddress, sta_mac);
+        if (nl80211_kick_device(interface, sta_mac) != 0) {
+            wifi_hal_info_print("%s:%d: STA %s not associated on ap_index %d, skip kick\n", __func__,
+                __LINE__, DeviceMacAddress, apIndex);
+        }
     }
 
     if (nl80211_set_acl(interface) != 0) {
