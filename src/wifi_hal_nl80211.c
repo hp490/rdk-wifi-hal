@@ -919,6 +919,43 @@ static void remove_station_from_other_interfaces(wifi_interface_info_t *interfac
 }
 
 #ifdef NL80211_ACL
+/* True at most once per second per sender; the least recently used slot goes to a new sender */
+static bool acl_deauth_allowed(wifi_interface_info_t *interface, const u8 *addr)
+{
+    acl_deauth_entry_t *oldest = &interface->acl_deauth_recent[0];
+    time_t now = time(NULL);
+    unsigned int i;
+
+    /* Many forged senders would evict each other, so the interface has a cap as well */
+    if (now != interface->acl_deauth_second) {
+        interface->acl_deauth_second = now;
+        interface->acl_deauth_count = 0;
+    }
+    if (interface->acl_deauth_count >= ACL_DEAUTH_RECENT_MAX) {
+        return false;
+    }
+
+    for (i = 0; i < ACL_DEAUTH_RECENT_MAX; i++) {
+        acl_deauth_entry_t *entry = &interface->acl_deauth_recent[i];
+
+        if (memcmp(entry->addr, addr, ETH_ALEN) == 0) {
+            if (entry->time == now) {
+                return false;
+            }
+            entry->time = now;
+            interface->acl_deauth_count++;
+            return true;
+        }
+        if (entry->time < oldest->time) {
+            oldest = entry;
+        }
+    }
+    memcpy(oldest->addr, addr, ETH_ALEN);
+    oldest->time = now;
+    interface->acl_deauth_count++;
+    return true;
+}
+
 bool is_core_acl_drop_mgmt_frame(wifi_interface_info_t *interface, mac_address_t sta_mac)
 {
     wifi_vap_info_t *l_vap_info;
@@ -932,7 +969,10 @@ bool is_core_acl_drop_mgmt_frame(wifi_interface_info_t *interface, mac_address_t
 
     if (l_vap_info->u.bss_info.mac_filter_enable == TRUE) {
         key = to_mac_str(sta_mac, sta_mac_str);
+        /* Only the entry's presence is used, so it cannot be freed under this check */
+        pthread_mutex_lock(&g_wifi_hal.acl_map_lock);
         l_acl_map = hash_map_get(interface->acl_map, key);
+        pthread_mutex_unlock(&g_wifi_hal.acl_map_lock);
 
         if (l_vap_info->u.bss_info.mac_filter_mode == wifi_mac_filter_mode_white_list) {
             if (l_acl_map != NULL)
@@ -961,7 +1001,9 @@ bool is_sta_in_blocked_state(wifi_interface_info_t *interface, mac_address_t sta
     if (l_vap_info->u.bss_info.mac_filter_enable == TRUE) {
         if (l_vap_info->u.bss_info.mac_filter_mode == wifi_mac_filter_mode_black_list) {
             key = to_mac_str(sta_mac, sta_mac_str);
+            pthread_mutex_lock(&g_wifi_hal.acl_map_lock);
             l_acl_map = hash_map_get(interface->acl_map, key);
+            pthread_mutex_unlock(&g_wifi_hal.acl_map_lock);
 
             if (l_acl_map != NULL) {
                 wifi_hal_dbg_print("%s:%d: MAC %s entry present in acl list\n", __func__, __LINE__, key);
@@ -2658,6 +2700,31 @@ int process_mgmt_frame(struct nl_msg *msg, void *arg)
         wifi_hal_dbg_print("%s:%d: received spurious frame event:%d"
             " on interface %s from" MACSTR " sent to hostapd wds:%d.\n", __func__, __LINE__,
             gnlh->cmd, interface->name, MAC2STR(event.rx_from_unknown.addr), event.rx_from_unknown.wds);
+
+#ifdef NL80211_ACL
+        /* STA removed/blocked by ACL must not be re-admitted via a stale 4addr/unknown frame */
+        if (interface->vap_info.vap_mode == wifi_vap_mode_ap &&
+            is_core_acl_drop_mgmt_frame(interface, (u8 *)event.rx_from_unknown.addr)) {
+            const u8 *src = event.rx_from_unknown.addr;
+
+            wifi_hal_dbg_print("%s:%d: MAC " MACSTR " blocked by ACL, dropping spurious frame "
+                "event:%d on interface %s\n", __func__, __LINE__, MAC2STR(src), gnlh->cmd,
+                interface->name);
+            /* Deauth the sender so a STA that missed its deauth stops thinking it is associated and
+             * rescans; a sta entry hostapd still tracks is cleaned up too. A forged source must
+             * never become a broadcast deauth, and every spurious frame lands here, hence the
+             * limit per sender. */
+            if (!is_multicast_ether_addr(src) && !is_zero_ether_addr(src) &&
+                (memcmp(src, interface->mac, ETH_ALEN) != 0) && acl_deauth_allowed(interface, src)) {
+                pthread_mutex_lock(&g_wifi_hal.hapd_lock);
+                ap_sta_disconnect(&interface->u.ap.hapd, NULL, src,
+                    WLAN_REASON_CLASS3_FRAME_FROM_NONASSOC_STA);
+                pthread_mutex_unlock(&g_wifi_hal.hapd_lock);
+            }
+            return NL_SKIP;
+        }
+#endif
+
         pthread_mutex_lock(&g_wifi_hal.hapd_lock);
         if (interface->vap_info.vap_mode != wifi_vap_mode_ap || is_wifi_hal_vap_mesh_sta(interface->vap_info.vap_index)) {
 #if defined(BANANA_PI_PORT) && (HOSTAPD_VERSION >= 211)
@@ -7295,9 +7362,58 @@ static int get_sta_handler(struct nl_msg *msg, void *arg)
     return NL_SKIP;
 }
 
+/* For a caller known not to hold steering_data_lock (steering works on blacklist VAPs only). It
+ * waits for hapd_lock, so a BLOCK always gets the deauth on air. */
+int nl80211_kick_device_wait(wifi_interface_info_t *interface, mac_address_t addr)
+{
+    if (interface->vap_info.vap_mode == wifi_vap_mode_ap) {
+        struct sta_info *sta;
+
+        pthread_mutex_lock(&g_wifi_hal.hapd_lock);
+        sta = ap_get_sta(&interface->u.ap.hapd, addr);
+        if (sta != NULL) {
+            ap_sta_disconnect(&interface->u.ap.hapd, sta, addr, WLAN_REASON_PREV_AUTH_NOT_VALID);
+            pthread_mutex_unlock(&g_wifi_hal.hapd_lock);
+            return 0;
+        }
+        pthread_mutex_unlock(&g_wifi_hal.hapd_lock);
+    }
+    return nl80211_kick_device(interface, addr);
+}
+
+#define KICK_HAPD_LOCK_WAIT_NS 100000000L /* 100 ms */
+
 int nl80211_kick_device(wifi_interface_info_t *interface, mac_address_t addr)
 {
     struct nl_msg *msg;
+    struct sta_info *sta;
+
+    /* Raw DEL_STATION leaves hostapd's sta entry (and WDS VLAN) stale and sends no frame.
+     * ap_sta_disconnect() is the hostapd call that also puts the deauth on air. u.ap is only
+     * valid in AP mode: the ipc wrapper does not check the mode. */
+    if (interface->vap_info.vap_mode == wifi_vap_mode_ap) {
+        /* Blacklist callers can hold steering_data_lock (re_configure_steering_mac_list), and the
+         * nl thread takes that lock with hapd_lock held: a plain lock here could deadlock. If
+         * hapd_lock stays busy, fall back to the raw DEL_STATION below, whose del_station event
+         * still cleans up hostapd. Whitelist callers use nl80211_kick_device_wait(). */
+        struct timespec deadline;
+
+        clock_gettime(CLOCK_REALTIME, &deadline);
+        deadline.tv_nsec += KICK_HAPD_LOCK_WAIT_NS;
+        if (deadline.tv_nsec >= 1000000000L) {
+            deadline.tv_sec++;
+            deadline.tv_nsec -= 1000000000L;
+        }
+        if (pthread_mutex_timedlock(&g_wifi_hal.hapd_lock, &deadline) == 0) {
+            sta = ap_get_sta(&interface->u.ap.hapd, addr);
+            if (sta != NULL) {
+                ap_sta_disconnect(&interface->u.ap.hapd, sta, addr, WLAN_REASON_PREV_AUTH_NOT_VALID);
+                pthread_mutex_unlock(&g_wifi_hal.hapd_lock);
+                return 0;
+            }
+            pthread_mutex_unlock(&g_wifi_hal.hapd_lock);
+        }
+    }
 
     msg = nl80211_drv_cmd_msg(g_wifi_hal.nl80211_id, interface, 0, NL80211_CMD_DEL_STATION);
     if (msg == NULL) {
@@ -11093,7 +11209,9 @@ int nl80211_connect_sta(wifi_interface_info_t *interface)
             interface->wpa_s.conf->sae_pwe = 2;
         } else {
             interface->wpa_s.conf->sae_pwe = 1;
-            interface->wpa_s.wpa->sae_pwe = 1;
+            if (interface->wpa_s.wpa != NULL) {
+                interface->wpa_s.wpa->sae_pwe = 1;
+            }
             interface->wpa_s.current_ssid->sae_pwe = 1;
         }
 
@@ -11222,8 +11340,12 @@ int nl80211_connect_sta(wifi_interface_info_t *interface)
                  * STA MACs are unknown in single-link mode — leave zeros. */
                 memcpy(temp_mac, vap->u.sta_info.mac, ETH_ALEN);
                 temp_mac[ETH_ALEN - 2] += i + 1;
-                memcpy(interface->wpa_s.wpa->mlo.links[i].addr, temp_mac, ETH_ALEN);
-                memcpy(interface->u.sta.wpa_sm->mlo.links[i].addr, temp_mac, ETH_ALEN);
+                if (interface->wpa_s.wpa != NULL) {
+                    memcpy(interface->wpa_s.wpa->mlo.links[i].addr, temp_mac, ETH_ALEN);
+                }
+                if (interface->u.sta.wpa_sm != NULL) {
+                    memcpy(interface->u.sta.wpa_sm->mlo.links[i].addr, temp_mac, ETH_ALEN);
+                }
                 memcpy(interface->wpa_s.links[i].addr, temp_mac, ETH_ALEN);
 
                 wifi_hal_dbg_print("%s:%d: sm link[%d]: STA=" MACSTR " AP=" MACSTR "\n",
@@ -13030,7 +13152,31 @@ static int nl80211_send_frame_cmd(wifi_interface_info_t *interface, unsigned int
     return ret;
 }
 
-static int wifi_sta_remove(wifi_interface_info_t *interface,
+/* Sends a deauth or disassoc frame; the two share the reason code position */
+static int wifi_send_sta_disconnect_frame(void *priv, const u8 *own_addr, const u8 *addr, u16 stype,
+    u16 reason, int link_id)
+{
+    struct ieee80211_mgmt mgmt;
+
+    memset(&mgmt, 0, sizeof(mgmt));
+    mgmt.frame_control = IEEE80211_FC(WLAN_FC_TYPE_MGMT, stype);
+    memcpy(mgmt.da, addr, ETH_ALEN);
+    memcpy(mgmt.sa, own_addr, ETH_ALEN);
+    memcpy(mgmt.bssid, own_addr, ETH_ALEN);
+    mgmt.u.deauth.reason_code = host_to_le16(reason);
+#ifdef HOSTAPD_2_11
+    return wifi_drv_send_mlme(priv, (u8 *)&mgmt, IEEE80211_HDRLEN + sizeof(mgmt.u.deauth), 0, 0, NULL,
+        0, 0, 0, link_id);
+#elif HOSTAPD_2_10
+    return wifi_drv_send_mlme(priv, (u8 *)&mgmt, IEEE80211_HDRLEN + sizeof(mgmt.u.deauth), 0, 0, NULL,
+        0, 0, 0);
+#else
+    return wifi_drv_send_mlme(priv, (u8 *)&mgmt, IEEE80211_HDRLEN + sizeof(mgmt.u.deauth), 0, 0, NULL,
+        0);
+#endif
+}
+
+static int wifi_sta_remove(wifi_interface_info_t *interface, const u8 *own_addr,
     const u8 *addr, int deauth, u16 reason_code)
 {
     struct nl_msg *msg;
@@ -13038,8 +13184,35 @@ static int wifi_sta_remove(wifi_interface_info_t *interface,
     int ret;
 
     wifi_hal_info_print("%s:%d: interface:%s send %s from:%s to:%s reason:%d\n", __func__, __LINE__,
-        interface->name, deauth ? "deauth" : "disassoc", to_mac_str(interface->mac, src_mac_str),
-        to_mac_str(addr, dst_mac_str), reason_code);
+        interface->name, deauth > 0 ? "deauth" : (deauth == 0 ? "disassoc" : "remove"),
+        to_mac_str(interface->mac, src_mac_str), to_mac_str(addr, dst_mac_str), reason_code);
+
+#ifdef WIFI_HAL_MAC80211_AP_SME
+    /* deauth == -1 is a plain station removal (hostapd calls it on every (re)association to clear
+     * a stale kernel entry), so no frame may go on air for it */
+    if (deauth >= 0) {
+        struct sta_info *sta;
+
+        /* mac80211 DEL_STATION never puts a frame on air, so send it here. The link is left to
+         * mac80211: cfg80211 rejects (-EINVAL) a link id the wdev has no valid link for. */
+        ret = wifi_send_sta_disconnect_frame(interface, own_addr, addr,
+            deauth ? WLAN_FC_STYPE_DEAUTH : WLAN_FC_STYPE_DISASSOC, reason_code,
+            NL80211_DRV_LINK_ID_NA);
+        if (ret != 0) {
+            wifi_hal_error_print("%s:%d: failed to transmit %s frame to:%s ret:%d\n", __func__,
+                __LINE__, deauth ? "deauth" : "disassoc", dst_mac_str, ret);
+        } else if (interface->vap_info.vap_mode == wifi_vap_mode_ap) {
+            /* DEL_STATION now would make mt76 free the queued frame. hostapd removes a STA it
+             * tracks once the frame's TX status arrives (WPA_DRIVER_FLAGS_DEAUTH_TX_STATUS). */
+            pthread_mutex_lock(&g_wifi_hal.hapd_lock);
+            sta = ap_get_sta(&interface->u.ap.hapd, addr);
+            pthread_mutex_unlock(&g_wifi_hal.hapd_lock);
+            if (sta != NULL) {
+                return 0;
+            }
+        }
+    }
+#endif /* WIFI_HAL_MAC80211_AP_SME */
 
     if (!(msg = nl80211_drv_cmd_msg(g_wifi_hal.nl80211_id, interface, 0,
             NL80211_CMD_DEL_STATION)) ||
@@ -13972,6 +14145,10 @@ int wifi_drv_send_mlme(void *priv, const u8 *data,
     callbacks = get_hal_device_callbacks();
 
     interface = (wifi_interface_info_t *)priv;
+    if (interface == NULL) {
+        wifi_hal_dbg_print("%s:%d: NULL priv pointer\n", __func__, __LINE__);
+        return -1;
+    }
     vap = &interface->vap_info;
     radio = get_radio_by_rdk_index(vap->radio_index);
     radio_param = &radio->oper_param;
@@ -14219,7 +14396,6 @@ int wifi_drv_sta_disassoc(void *priv, const u8 *own_addr, const u8 *addr, u16 re
     wifi_radio_info_t *radio;
     //wifi_radio_operationParam_t *radio_param;
     wifi_driver_data_t *drv;
-    struct ieee80211_mgmt mgmt;
 #if HOSTAPD_VERSION >= 211
 #if !defined(KERNEL_6_6)
     int link_id = -1;
@@ -14227,6 +14403,10 @@ int wifi_drv_sta_disassoc(void *priv, const u8 *own_addr, const u8 *addr, u16 re
 #endif // HOSTAPD_VERSION >= 211
 
     interface = (wifi_interface_info_t *)priv;
+    if (interface == NULL) {
+        wifi_hal_dbg_print("%s:%d: NULL priv pointer\n", __func__, __LINE__);
+        return -1;
+    }
     vap = &interface->vap_info;
     radio = get_radio_by_rdk_index(vap->radio_index);
     //radio_param = &radio->oper_param;
@@ -14251,24 +14431,14 @@ int wifi_drv_sta_disassoc(void *priv, const u8 *own_addr, const u8 *addr, u16 re
     }
 #endif // _PLATFORM_RASPBERRYPI_ || _PLATFORM_BANANAPI_R4_
     if (drv->device_ap_sme) {
-        return wifi_sta_remove(interface, addr, 0, reason);
+        return wifi_sta_remove(interface, own_addr, addr, 0, reason);
     }
 
-    memset(&mgmt, 0, sizeof(mgmt));
-    mgmt.frame_control = IEEE80211_FC(WLAN_FC_TYPE_MGMT,
-                                        WLAN_FC_STYPE_DISASSOC);
-    memcpy(mgmt.da, addr, ETH_ALEN);
-    memcpy(mgmt.sa, own_addr, ETH_ALEN);
-    memcpy(mgmt.bssid, own_addr, ETH_ALEN);
-    mgmt.u.disassoc.reason_code = host_to_le16(reason);
-#ifdef HOSTAPD_2_11 //2.11
-    return wifi_drv_send_mlme(priv, (u8 *) &mgmt, IEEE80211_HDRLEN + sizeof(mgmt.u.disassoc), 0, 0, NULL, 0, 0, 0, link_id);
-#elif HOSTAPD_2_10 //2.10
-    return wifi_drv_send_mlme(priv, (u8 *) &mgmt, IEEE80211_HDRLEN + sizeof(mgmt.u.disassoc), 0, 0, NULL, 0, 0, 0);
+#if HOSTAPD_VERSION >= 211
+    return wifi_send_sta_disconnect_frame(priv, own_addr, addr, WLAN_FC_STYPE_DISASSOC, reason, link_id);
 #else
-    return wifi_drv_send_mlme(priv, (u8 *) &mgmt, IEEE80211_HDRLEN + sizeof(mgmt.u.disassoc), 0, 0, NULL, 0);
+    return wifi_send_sta_disconnect_frame(priv, own_addr, addr, WLAN_FC_STYPE_DISASSOC, reason, -1);
 #endif
-	return 0;
 }
 
 
@@ -14320,7 +14490,6 @@ int wifi_drv_sta_deauth(void *priv, const u8 *own_addr, const u8 *addr, u16 reas
     wifi_radio_info_t *radio;
     wifi_radio_operationParam_t *radio_param;
     wifi_driver_data_t *drv;
-    struct ieee80211_mgmt mgmt;
     u8 channel;
     int freq;
     char country[8];
@@ -14329,6 +14498,10 @@ int wifi_drv_sta_deauth(void *priv, const u8 *own_addr, const u8 *addr, u16 reas
     wifi_hal_dbg_print("%s:%d: Enter %s %d\n", __func__, __LINE__, to_mac_str(addr, mac_str), reason);
 
     interface = (wifi_interface_info_t *)priv;
+    if (interface == NULL) {
+        wifi_hal_dbg_print("%s:%d: NULL priv pointer\n", __func__, __LINE__);
+        return -1;
+    }
     vap = &interface->vap_info;
     radio = get_radio_by_rdk_index(vap->radio_index);
     radio_param = &radio->oper_param;
@@ -14366,25 +14539,15 @@ int wifi_drv_sta_deauth(void *priv, const u8 *own_addr, const u8 *addr, u16 reas
     }
 #endif
     if (drv->device_ap_sme) {
-        return wifi_sta_remove(interface, addr, 1, reason);
+        return wifi_sta_remove(interface, own_addr, addr, 1, reason);
     }
 
-    memset(&mgmt, 0, sizeof(mgmt));
-    mgmt.frame_control = IEEE80211_FC(WLAN_FC_TYPE_MGMT,
-                                        WLAN_FC_STYPE_DEAUTH);
-    memcpy(mgmt.da, addr, ETH_ALEN);
-    memcpy(mgmt.sa, own_addr, ETH_ALEN);
-    memcpy(mgmt.bssid, own_addr, ETH_ALEN);
-    mgmt.u.deauth.reason_code = host_to_le16(reason);
 	wifi_hal_info_print("%s:%d: Send drv mlme: client mac:%s reason_code:%d\n", __func__, __LINE__, to_mac_str(addr, mac_str), reason);
-#ifdef HOSTAPD_2_11 //2.11
-    return wifi_drv_send_mlme(priv, (u8 *) &mgmt, IEEE80211_HDRLEN + sizeof(mgmt.u.deauth), 0, 0, NULL, 0, 0, 0, link_id);
-#elif HOSTAPD_2_10 //2.10
-    return wifi_drv_send_mlme(priv, (u8 *) &mgmt, IEEE80211_HDRLEN + sizeof(mgmt.u.deauth), 0, 0, NULL, 0, 0, 0);
+#if HOSTAPD_VERSION >= 211
+    return wifi_send_sta_disconnect_frame(priv, own_addr, addr, WLAN_FC_STYPE_DEAUTH, reason, link_id);
 #else
-    return wifi_drv_send_mlme(priv, (u8 *) &mgmt, IEEE80211_HDRLEN + sizeof(mgmt.u.deauth), 0, 0, NULL, 0);
+    return wifi_send_sta_disconnect_frame(priv, own_addr, addr, WLAN_FC_STYPE_DEAUTH, reason, -1);
 #endif
-    return 0;
 }
 
 #if HOSTAPD_VERSION >= 211 //2.11
@@ -15211,7 +15374,12 @@ int wifi_drv_sta_remove(void *priv, const u8 *addr)
 
     wifi_hal_dbg_print("%s:%d: Enter\n", __func__, __LINE__);
 
-    return wifi_sta_remove(interface, addr, -1, 1);
+    if (interface == NULL) {
+        wifi_hal_dbg_print("%s:%d: NULL priv pointer\n", __func__, __LINE__);
+        return -1;
+    }
+
+    return wifi_sta_remove(interface, NULL, addr, -1, 1);
 }
 
 int wifi_drv_sta_add(void *priv, struct hostapd_sta_add_params *params)
@@ -16572,15 +16740,18 @@ int nl80211_put_acl(struct nl_msg *msg, wifi_interface_info_t *interface)
         }
 
         if (interface->acl_map != NULL) {
+            pthread_mutex_lock(&g_wifi_hal.acl_map_lock);
             acl_map = hash_map_get_first(interface->acl_map);
             while (acl_map != NULL) {
                 if (nla_put(msg, i, ETH_ALEN, acl_map->mac_addr)) {
+                    pthread_mutex_unlock(&g_wifi_hal.acl_map_lock);
                     wifi_hal_dbg_print("%s:%d Failed to add MAC to ACL list\n", __func__, __LINE__);
                     return -ENOMEM;
                 }
                 acl_map = hash_map_get_next(interface->acl_map, acl_map);
                 i++;
             }
+            pthread_mutex_unlock(&g_wifi_hal.acl_map_lock);
         }
         if (i == 0) {
             if (nla_put(msg, i, ETH_ALEN, null_mac)) {
@@ -16644,9 +16815,11 @@ int nl80211_set_acl(wifi_interface_info_t *interface)
         }
 
         if (interface->acl_map != NULL) {
+            pthread_mutex_lock(&g_wifi_hal.acl_map_lock);
             acl_map = hash_map_get_first(interface->acl_map);
             while (acl_map != NULL) {
                 if (nla_put(msg, i, ETH_ALEN, acl_map->mac_addr) < 0) {
+                    pthread_mutex_unlock(&g_wifi_hal.acl_map_lock);
                     wifi_hal_dbg_print("%s %d: nl80211: Failed to add MAC to ACL list\n", __func__, __LINE__);
                     nla_nest_cancel(msg, acl);
                     nlmsg_free(msg);
@@ -16655,6 +16828,7 @@ int nl80211_set_acl(wifi_interface_info_t *interface)
                 acl_map = hash_map_get_next(interface->acl_map, acl_map);
                 i++;
             }
+            pthread_mutex_unlock(&g_wifi_hal.acl_map_lock);
         }
         if (i == 0) {
             if (nla_put(msg, i, ETH_ALEN, null_mac) < 0) {
@@ -18358,7 +18532,7 @@ int wifi_drv_get_ssid(void *priv, u8 *ssid)
 {
     wifi_hal_dbg_print("%s:%d: Enter\n", __func__, __LINE__);
 #if defined(CONFIG_WIFI_EMULATOR) || defined(BANANA_PI_PORT)
-    if (ssid == NULL) {
+    if (priv == NULL || ssid == NULL) {
         wifi_hal_dbg_print("%s:%d: NULL Pointer\n", __func__, __LINE__);
         return 0;
     }
@@ -18392,6 +18566,11 @@ int wifi_supplicant_drv_associate(void *priv, struct wpa_driver_associate_params
 
     int ver = 0;
     u32 cipher;
+
+    if (interface == NULL) {
+        wifi_hal_dbg_print("%s:%d: NULL priv pointer\n", __func__, __LINE__);
+        return -1;
+    }
 
     if ((msg = nl80211_drv_cmd_msg(g_wifi_hal.nl80211_id, interface, 0, NL80211_CMD_ASSOCIATE)) == NULL) {
         return -1;
@@ -18443,7 +18622,8 @@ int wifi_supplicant_drv_associate(void *priv, struct wpa_driver_associate_params
     }
 
 #if defined(CONFIG_IEEE80211BE) && defined(CONFIG_GENERIC_MLO)
-    if (params->mld_params.mld_addr && params->mld_params.valid_links > 0) {
+    if (params->mld_params.mld_addr && params->mld_params.valid_links > 0 &&
+        interface->wpa_s.wpa != NULL) {
         struct wpa_driver_mld_params *mld_params = &params->mld_params;
         struct wpa_sm_mlo *wpa_mlo = &interface->wpa_s.wpa->mlo;
         struct nlattr *links, *attr;

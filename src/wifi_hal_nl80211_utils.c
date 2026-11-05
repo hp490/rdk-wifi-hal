@@ -6036,7 +6036,9 @@ int wifi_hal_set_mld_link_id(wifi_interface_info_t *interface, unsigned char lin
 #if defined(CONFIG_IEEE80211BE) && defined(CONFIG_GENERIC_MLO)
     if (interface->vap_info.vap_mode == wifi_vap_mode_sta) {
         interface->wpa_s.mlo_assoc_link_id = link_id;
-        interface->wpa_s.wpa->mlo.assoc_link_id = link_id;
+        if (interface->wpa_s.wpa != NULL) {
+            interface->wpa_s.wpa->mlo.assoc_link_id = link_id;
+        }
         return 0;
     }
 #else

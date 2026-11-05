@@ -155,7 +155,9 @@ static void nl80211_new_station_event(wifi_interface_info_t *interface, struct n
     pthread_mutex_lock(&g_wifi_hal.hapd_lock);
     if (interface->vap_info.vap_mode != wifi_vap_mode_ap || is_wifi_hal_vap_mesh_sta(interface->vap_info.vap_index)) {
 #if defined(BANANA_PI_PORT) && (HOSTAPD_VERSION >= 211)
+        pthread_mutex_lock(&g_wifi_hal.hapd_lock);
         supplicant_event(&interface->wpa_s, EVENT_ASSOC, &event);
+        pthread_mutex_unlock(&g_wifi_hal.hapd_lock);
 #endif
     } else {
         wpa_supplicant_event(&interface->u.ap.hapd, EVENT_ASSOC, &event);
@@ -187,7 +189,11 @@ static void nl80211_del_station_event(wifi_interface_info_t *interface, struct n
     pthread_mutex_lock(&g_wifi_hal.hapd_lock);
     if (interface->vap_info.vap_mode != wifi_vap_mode_ap || is_wifi_hal_vap_mesh_sta(interface->vap_info.vap_index)) {
 #if defined(BANANA_PI_PORT) && (HOSTAPD_VERSION >= 211)
-        supplicant_event(&interface->wpa_s, EVENT_DISASSOC, &event);
+        pthread_mutex_lock(&g_wifi_hal.hapd_lock);
+        if (interface->u.sta.wpa_sm != NULL && interface->wpa_s.wpa != NULL) {
+            supplicant_event(&interface->wpa_s, EVENT_DISASSOC, &event);
+        }
+        pthread_mutex_unlock(&g_wifi_hal.hapd_lock);
 #endif
     } else {
         wpa_supplicant_event(&interface->u.ap.hapd, EVENT_DISASSOC, &event);
@@ -246,9 +252,13 @@ static void nl80211_associate_event(wifi_interface_info_t *interface, struct nla
             }
             event.assoc_reject.status_code = status;
 #if defined(BANANA_PI_PORT) && (HOSTAPD_VERSION >= 211)
+            pthread_mutex_lock(&g_wifi_hal.hapd_lock);
             supplicant_event(&interface->wpa_s, EVENT_ASSOC_REJECT, &event);
+            pthread_mutex_unlock(&g_wifi_hal.hapd_lock);
 #else
+            pthread_mutex_lock(&g_wifi_hal.hapd_lock);
             wpa_supplicant_event_wpa(&interface->wpa_s, EVENT_ASSOC_REJECT, &event);
+            pthread_mutex_unlock(&g_wifi_hal.hapd_lock);
 #endif // BANANA_PI_PORT
             return;
         }
@@ -285,9 +295,13 @@ static void nl80211_associate_event(wifi_interface_info_t *interface, struct nla
     }
 
 #if defined(BANANA_PI_PORT) && (HOSTAPD_VERSION >= 211)
+    pthread_mutex_lock(&g_wifi_hal.hapd_lock);
     supplicant_event(&interface->wpa_s, EVENT_ASSOC, &event);
+    pthread_mutex_unlock(&g_wifi_hal.hapd_lock);
 #else
+    pthread_mutex_lock(&g_wifi_hal.hapd_lock);
     wpa_supplicant_event_wpa(&interface->wpa_s, EVENT_ASSOC, &event);
+    pthread_mutex_unlock(&g_wifi_hal.hapd_lock);
 #endif // BANANA_PI_PORT
 }
 
@@ -315,9 +329,13 @@ static void nl80211_authenticate_event(wifi_interface_info_t *interface, struct 
     }
 
 #if defined(BANANA_PI_PORT) && (HOSTAPD_VERSION >= 211)
+    pthread_mutex_lock(&g_wifi_hal.hapd_lock);
     supplicant_event(&interface->wpa_s, EVENT_AUTH, &event);
+    pthread_mutex_unlock(&g_wifi_hal.hapd_lock);
 #else
+    pthread_mutex_lock(&g_wifi_hal.hapd_lock);
     wpa_supplicant_event_wpa(&interface->wpa_s, EVENT_AUTH, &event);
+    pthread_mutex_unlock(&g_wifi_hal.hapd_lock);
 #endif // BANANA_PI_PORT
 }
 #endif //CONFIG_WIFI_EMULATOR || BANANA_PI_PORT
@@ -794,6 +812,13 @@ static void nl80211_connect_event(wifi_interface_info_t *interface, struct nlatt
         wifi_hal_dbg_print("%s:%d: pmkid attribute absent\n", __func__, __LINE__);
     }
 
+    /* Freed by a disconnect event that came first; everything below needs it */
+    if (interface->u.sta.wpa_sm == NULL) {
+        wifi_hal_error_print("%s:%d: connect event on %s with no state machine\n", __func__, __LINE__,
+            interface->name);
+        return;
+    }
+
     if (get_vap_security_mode(&interface->vap_info, sec) != wifi_security_mode_none) {
         eapol_sm_notify_eap_fail(interface->u.sta.wpa_sm->eapol, 0);
         eapol_sm_notify_eap_success(interface->u.sta.wpa_sm->eapol, 0);
@@ -898,22 +923,29 @@ static void nl80211_disconnect_event(wifi_interface_info_t *interface, struct nl
         callbacks->sta_conn_status_callback(vap->vap_index, &bss, &sta);
     }
 
+    pthread_mutex_lock(&g_wifi_hal.hapd_lock);
+    if (interface->u.sta.connect_in_progress) {
+        /* Left over from before this connect: it must not touch the state being set up */
+        pthread_mutex_unlock(&g_wifi_hal.hapd_lock);
+        wifi_hal_info_print("%s:%d: ignoring stale disconnect on %s\n", __func__, __LINE__,
+            interface->name);
+        return;
+    }
 #if defined(CONFIG_WIFI_EMULATOR) || defined(BANANA_PI_PORT)
+    /* Timer/flag cleanup needs no wpa state machine, so it runs for open/non-RSN bSTAs too;
+     * only the supplicant event itself requires wpa_s.wpa. */
     wpa_supplicant_cancel_auth_timeout(&interface->wpa_s);
     interface->wpa_s.disconnected = 1;
+    if (interface->wpa_s.wpa != NULL) {
 #if defined(BANANA_PI_PORT) && (HOSTAPD_VERSION >= 211)
-    supplicant_event(&interface->wpa_s, EVENT_DISASSOC, NULL);
+        supplicant_event(&interface->wpa_s, EVENT_DISASSOC, NULL);
 #else
-    wpa_supplicant_event_wpa(&interface->wpa_s, EVENT_DISASSOC, NULL);
+        wpa_supplicant_event_wpa(&interface->wpa_s, EVENT_DISASSOC, NULL);
 #endif // BANANA_PI_PORT
-#endif
-    if (interface->u.sta.wpa_sm != NULL) {
-        eapol_sm_deinit(interface->u.sta.wpa_sm->eapol);
-        interface->u.sta.wpa_sm->eapol = NULL;
-
-        wpa_sm_deinit(interface->u.sta.wpa_sm);
-        interface->u.sta.wpa_sm = NULL;
     }
+#endif
+    wifi_hal_sta_sm_free(interface);
+    pthread_mutex_unlock(&g_wifi_hal.hapd_lock);
 
     if ((attr = tb[NL80211_ATTR_REASON_CODE]) != NULL) {
         wifi_hal_info_print("%s:%d: reason code:%d\n", __func__, __LINE__, nla_get_u16(attr));
